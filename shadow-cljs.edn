@@ -1,0 +1,5 @@
+{:deps {:aliases [:dev]}
+ :builds
+ {:node-repl
+  {:target :node-script
+   :output-to "target/node-repl.js"}}}

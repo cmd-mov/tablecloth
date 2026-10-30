@@ -1,7 +1,12 @@
 {:extra-paths ["data"]
  :deps {org.clojure/clojure              {:mvn/version "1.12.5"}
-        techascent/tech.ml.dataset       {:mvn/version "8.024"}}
+        techascent/tech.ml.dataset       {:mvn/version "8.024"}
+        ;; com.cnuernber/tmdjs {:mvn/version "2.002"}
+        com.cnuernber/tmdjs              {:git/url "https://github.com/cnuernber/tmdjs"
+                                          :git/sha "5d9d9932d9e4c321681978f7354213a762cb7d14"}}
  :aliases {:dev {:extra-deps {#_#_org.clojure/clojure {:mvn/version "1.13.0-alpha6"}
+                              ;; org.clojure/clojurescript {:mvn/version "1.12.145"}
+                              thheller/shadow-cljs      {:mvn/version "2.28.18"}
                               org.scicloj/clay {:mvn/version "2.0.20"}
                               org.scicloj/note-to-test {:mvn/version "1-alpha7"}}}
            :test {:extra-deps {#_#_org.clojure/clojure {:mvn/version "1.13.0-alpha6"}
