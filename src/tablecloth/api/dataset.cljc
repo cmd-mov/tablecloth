@@ -1,27 +1,33 @@
 (ns tablecloth.api.dataset
   (:refer-clojure :exclude [concat])
   (:require
-   [clojure.tools.logging :as logging]
    [tablecloth.api.utils :refer [grouped? iterable-sequence? map-inst?
                                  mark-as-group]]
    [tech.v3.dataset :as ds]
-   [tech.v3.dataset.column :as col]
-   [tech.v3.dataset.print :as p]
-   [tech.v3.dataset.protocols :as prot]
-   [tech.v3.dataset.tensor :as ds-tensor]
-   [tech.v3.tensor :as tensor]
-   [ham-fisted.api :as hf])
-  (:import
-   [java.io FileNotFoundException]))
-
-;; auto-registers handlers for more file types,
-;; if 'scicloj.dataset-io is on classpath
-;; tablecloth has no dependency to it, but 'noj' has
-(try
-  ((requiring-resolve 'scicloj.dataset-io/enable-all-input-formats!))
-  (catch FileNotFoundException _
-    ;ignore
-    ))
+   #?@(:clj
+       [[clojure.tools.logging :as logging]
+        [tech.v3.dataset.column :as col]
+        [tech.v3.dataset.print :as p]
+        [tech.v3.dataset.protocols :as prot]
+        [tech.v3.dataset.tensor :as ds-tensor]
+        [tech.v3.tensor :as tensor]
+        [ham-fisted.api :as hf]]
+       :cljs
+       [[tech.v3.dataset.protocols :as prot]
+        [tech.v3.datatype :as dtype]
+        [tech.v3.dataset.impl.column :as col-impl]
+        [tech.v3.dataset.impl.dataset :as ds-impl]
+        [tablecloth.api.utils :refer [add-or-update-column]]])
+  #?(:clj (:import
+           [java.io FileNotFoundException]))
+    ;; auto-registers handlers for more file types,
+  ;; if 'scicloj.dataset-io is on classpathn
+  ;; tablecloth has no dependency to it, but 'noj' has
+  #?(:clj (try
+            ((requiring-resolve 'scicloj.dataset-io/enable-all-input-formats!))
+            (catch FileNotFoundException _
+                                        ;ignore
+              )))))
 
 ;;;;;;;;;;;;;;;;;;;;;
 ;; DATASET CREATION
@@ -30,7 +36,13 @@
 (defn dataset?
   "Is `ds` a `dataset` type?"
   [ds]
-  (prot/is-dataset? ds))
+  #?(:clj (prot/is-dataset? ds)
+     :cljs (ds/dataset? ds)))
+
+(defn- column?
+  [c]
+  #?(:clj (col/is-column? c)
+     :cljs (instance? col-impl/Column c)))
 
 (defn empty-ds?
   [ds]
@@ -48,18 +60,44 @@
       (apply array-map (interleave (keys map-ds)
                                    (map #(if (iterable-sequence? %) % (repeat c %)) (vals map-ds))))))
 
+#?(:cljs (defn- cljs-new-column [col-name col-data]
+           (-> (ds/->dataset {col-name col-data})
+               (get col-name))))
+
 (defn- from-tensor
   [data column-names layout dataset-name]
-  (let [t (tensor/->tensor (if (set? data)
-                             (seq data)
-                             data))
-        t (-> (if (= layout :as-columns) (tensor/transpose t [1 0]) t)
-              (ds-tensor/tensor->dataset dataset-name))]
-    (if column-names
-      (ds/rename-columns t (zipmap (range (ds/column-count t)) column-names))
-      t)))
+  #?(:clj
+     (let [t (tensor/->tensor (if (set? data)
+                                (seq data)
+                                data))
+           t (-> (if (= layout :as-columns) (tensor/transpose t [1 0]) t)
+                 (ds-tensor/tensor->dataset dataset-name))]
+       (if column-names
+         (ds/rename-columns t (zipmap (range (ds/column-count t)) column-names))
+         t))
+     :cljs
+     (let [seq-data (if (set? data) (seq data) (map vec data))
+           cols-data (if (= layout :as-columns)
+                       seq-data
+                       ;; Transpose rows into columns
+                       (if (seq seq-data)
+                         (apply mapv vector seq-data)
+                         []))
+           col-names (or column-names (range (count cols-data)))
+           cols (map (fn [cn col-vals] (cljs-new-column cn col-vals))
+                     col-names
+                     cols-data)]
+       (ds-impl/new-dataset {:dataset-name dataset-name} cols))))
 
-(defn- array-of-arrays? [in] (and in (= "[[" (subs (.getName (class in)) 0 2))))
+(defn- array-of-arrays? [in]
+  #?(:clj (and in (= "[[" (subs (.getName (class in)) 0 2)))
+     :cljs (and (array? in)
+                (pos? (alength in))
+                (every? array? in))))
+
+(defn- column? [c]
+  #?(:clj (col/is-column? c)
+     :cljs (instance? col-impl/Column c)))
 
 (defn dataset
   "Create a `dataset`.
@@ -79,7 +117,9 @@
   ds/->dataset documentation:
 
   "
-  ([] (ds/new-dataset nil))
+  ([]
+   #?(:clj (ds/new-dataset nil)
+      :cljs (ds-impl/new-dataset nil)))
   ([data]
    (dataset data nil))
   ([data {:keys [single-value-column-name column-names layout dataset-name stack-trace? error-column?]
@@ -89,32 +129,46 @@
               (pos? (count data)) ;; shouldn't be empty
               (every? iterable-sequence? data)
               (every? #(= 2 (count %)) data))
-     (logging/warn "Dataset creation behaviour changed for 2d 2-element arrays in v7.029. See https://github.com/scicloj/tablecloth/issues/142 for details."))
+     #?(:clj (logging/warn "Dataset creation behaviour changed for 2d 2-element arrays in v7.029. See https://github.com/scicloj/tablecloth/issues/142 for details.")))
    (cond
-     (prot/is-dataset? data) data
+     (dataset? data) data
      (map-inst? data) (ds/->dataset data options)
      (and (iterable-sequence? data)
-          (every? col/is-column? data)) (ds/new-dataset options data)
+          (every? column? data))
+     #?(:clj (ds/new-dataset options data)
+        :cljs (ds-impl/new-dataset options data))
      (or (array-of-arrays? data)
          (and (iterable-sequence? data)
               (not-every? map? data))) (from-tensor data column-names layout dataset-name)
-     (array-of-arrays? data) (ds/new-dataset options (map ds/new-column (or column-names (range)) data))
+     (array-of-arrays? data)
+     #?(:clj (ds/new-dataset options (map ds/new-column (or column-names (range)) data))
+        :cljs (ds-impl/new-dataset options (map cljs-new-column (or column-names (range)) data)))
      ;; empty data but column-names exist
      (and (not data)
-          column-names) (ds/new-dataset options (map (fn [n] (ds/new-column n [])) column-names))
-     :else (try (ds/->dataset data options)
-                (catch FileNotFoundException fnfe (throw fnfe))
-                ;; create a singleton
-                (catch Exception e
-                  (do
-                    (when stack-trace? (.printStackTrace e))
-                    (let [row {single-value-column-name data}]
-                      (ds/->dataset (if error-column?
-                                      (assoc row :$error (.getMessage e))
-                                      row) options))))))))
+          column-names)
+     #?(:clj (ds/new-dataset options (map (fn [n] (ds/new-column n [])) column-names))
+        :cljs (ds-impl/new-dataset options (map (fn [n] (cljs-new-column n [])) column-names)))
+     :else
+     #?(:clj
+        (try (ds/->dataset data options)
+             (catch FileNotFoundException fnfe (throw fnfe))
+             (catch Exception e
+               (when stack-trace? (.printStackTrace e))
+               (let [row {single-value-column-name data}]
+                 (ds/->dataset (if error-column?
+                                 (assoc row :$error (.getMessage e))
+                                 row) options))))
+        :cljs
+        (try (ds/->dataset data options)
+             (catch :default e
+               (when stack-trace? (js/console.error e))
+               (let [row {single-value-column-name data}]
+                 (ds/->dataset (if error-column?
+                                 (assoc row :$error (ex-message e))
+                                 row) options))))))))
 
 ;; https://github.com/scicloj/tablecloth/issues/112
-(alter-meta! #'dataset update :doc str (:doc (meta #'ds/->dataset)))
+#?(:clj (alter-meta! #'dataset update :doc str (:doc (meta #'ds/->dataset))))
 
 (defn shape
   "Returns shape of the dataset [rows, cols]"
@@ -126,7 +180,7 @@
   [ds]
   (dataset (->> (ds/columns ds)
                 (map meta))
-           {:dataset-name (str (ds/dataset-name ds) " :column info")}))
+           {:dataset-name (str #?(:clj (ds/dataset-name ds) :cljs (-> ds meta :name)) " :column info")}))
 
 (defn info
   "Returns a statistcial information about the columns of a dataset.
@@ -134,21 +188,26 @@
   ([ds] (info ds :descriptive))
   ([ds result-type]
    (condp = result-type
-     :descriptive (ds/descriptive-stats ds)
+     :descriptive #?(:clj (ds/descriptive-stats ds)
+                     :cljs (columns-info ds))
      :columns (columns-info ds)
      (let [grouped? (boolean (:grouped? (meta ds)))
-           nm (ds/dataset-name ds)
+           nm #?(:clj (ds/dataset-name ds)
+                 :cljs (-> ds meta :name))
            inf {:name nm
                 :grouped? grouped?}]
        (dataset (if grouped?
-                  (assoc inf :groups (ds/row-count inf))
+                  (assoc inf :groups (ds/row-count ds))
                   (assoc inf
                          :rows (ds/row-count ds)
                          :columns (ds/column-count ds)))
                 {:dataset-name (str nm " :basic info")})))))
 
-
-
+(defn- ->double-array
+  [xs]
+  #?(:clj (hf/double-array xs)
+     :cljs (js/Float64Array.from (into-array xs))))
+ 
 (defn columns
   "Returns columns of dataset. Result type can be any of:
   * `:as-map`
@@ -161,7 +220,7 @@
    (let [cols (ds/columns ds)]
      (case result-type
        :as-map (zipmap (ds/column-names ds) cols)
-       :as-double-arrays (into-array (map (fn [row] (hf/double-array row)) (ds/columns ds)))
+       :as-double-arrays (into-array (map (fn [row] (->double-array row)) (ds/columns ds)))
        :as-seqs cols
        :as-vecs (map vec cols)
        cols))))
@@ -181,20 +240,31 @@
                     :or {nil-missing? true}
                     :as options}]
    (let [options (assoc options :nil-missing? nil-missing?)]
-     (case result-type
-       :as-maps (ds/mapseq-reader ds options)
-       :as-double-arrays (into-array (map (fn [row] (hf/double-array row)) (ds/value-reader ds)))
-       :as-seqs (ds/value-reader ds options)
-       :as-vecs (ds/rowvecs ds options)
-       (ds/value-reader ds options)))))
+     #?(:clj
+        (case result-type
+          :as-maps (ds/mapseq-reader ds options)
+          :as-double-arrays (into-array (map (fn [row] (hf/double-array row)) (ds/value-reader ds)))
+          :as-seqs (ds/value-reader ds options)
+          :as-vecs (ds/rowvecs ds options)
+          (ds/value-reader ds options))
+        :cljs
+        (case result-type
+          :as-maps (let [ms (ds/rows ds)]
+                     (if nil-missing?
+                       ms
+                       (map #(into {} (remove (comp nil? val) %)) ms)))
+          :as-double-arrays (into-array (map ->double-array (ds/rowvecs ds)))
+          :as-seqs (ds/rowvecs ds)
+          :as-vecs (ds/rowvecs ds)
+          (ds/rowvecs ds))))))
 
 (defn print-dataset
-  "Prints dataset into console. For options see
-  tech.v3.dataset.print/dataset-data->str"
-  ([ds] (println (p/dataset->str ds)))
-  ([ds options] (println (p/dataset->str ds options))))
-
-;;
+  ([ds]
+   #?(:clj (println (p/dataset->str ds))
+      :cljs (println ds)))
+  ([ds options]
+   #?(:clj (println (p/dataset->str ds options))
+      :cljs (println (vary-meta ds merge options)))))
 
 (defn get-entry
   "Returns a single value from given column and row"
@@ -209,7 +279,8 @@
     (if (and (grouped? ds)
              (every? grouped? datasets))
       (-> res
-          (ds/add-or-update-column :group-id (range (ds/row-count res)))
+          #?(:clj (ds/add-or-update-column :group-id (range (ds/row-count res)))
+             :cljs (add-or-update-column :group-id (range (ds/row-count res))))
           (mark-as-group))
       res)))
 
@@ -220,4 +291,4 @@
 
 (defn concat-copying
   "Joins rows from other datasets via a copy of data"
-  [dataset & datasets] (apply do-concat ds/concat-copying dataset datasets))
+  [dataset & datasets] (apply do-concat #?(:clj ds/concat-copying :cljs ds/concat) dataset datasets))
