@@ -1,10 +1,12 @@
 (ns tablecloth.api.utils
   (:refer-clojure :exclude [pmap])
   (:require [tech.v3.dataset :as ds]
-            [tech.v3.io :as tio]
-            [tech.v3.parallel.for :refer [pmap]])
-  (:import [java.util Map]))
+            #?(:clj [tech.v3.io :as tio])
+            #?(:clj [tech.v3.parallel.for :refer [pmap]])
+            [clojure.set])
+  #?(:clj (:import [java.util Map])))
 
+#?(:cljs (def pmap map))
 ;;;;;;;;;;;;
 ;; HELPERS
 ;;;;;;;;;;;;
@@ -14,13 +16,19 @@
   [xs]
   (or (sequential? xs)      
       (and (not (map? xs))
-           (instance? Iterable xs))))
+           #?(:clj (instance? Iterable xs)
+              :cljs (satisfies? IIterable xs)))))
 
-(defn map-inst? [m] (instance? Map m))
+(defn map-inst? [m]
+  #?(:clj (instance? Map m)
+     :cljs (map? m)))
 
 (defn ->str
   [v]
-  (if (instance? clojure.lang.Named v) (name v) (str v)))
+  (if #?(:clj (instance? clojure.lang.Named v)
+         :cljs (satisfies? INamed v))
+    (name v)
+    (str v)))
 
 (defn rank
   "Sample ranks. See [R docs](https://www.rdocumentation.org/packages/base/versions/3.6.1/topics/rank).
@@ -202,7 +210,8 @@ column-names function returns names according to columns-selector
              (map? columns-selector) (filter-column-names-with-order ds (keys columns-selector) meta-field)
              :else (let [csel-fn (cond
                                    (set? columns-selector) #(contains? columns-selector %)
-                                   (instance? java.util.regex.Pattern columns-selector) #(re-matches columns-selector (str %))
+                                   (instance? #?(:clj java.util.regex.Pattern :cljs js/RegExp) columns-selector)                                     
+                                   #(re-matches columns-selector (str %))
                                    (fn? columns-selector) columns-selector
                                    :else #(= % columns-selector))]
                      (filter-column-names ds csel-fn meta-field)))))))
@@ -213,22 +222,26 @@ column-names function returns names according to columns-selector
   [filename]
   (re-matches #".+\.gz$" filename))
 
-(defn ^:deprecated write-nippy!
-  [ds filename]
-  (ds/write! ds filename))
+#?(:clj
+   (defn ^:deprecated write-nippy!
+     [ds filename]
+     (ds/write! ds filename)))
 
-(defn ^:deprecated read-nippy
-  [filename]
-  (ds/->dataset filename))
+#?(:clj
+   (defn ^:deprecated read-nippy
+     [filename]
+     (ds/->dataset filename)))
 
 ;; parallel concat
 
 (defn parallel-concat
   [& dss]
-  (let [cnt (max 10 (int (Math/sqrt (count dss))))        
-        subdss (pmap (partial apply ds/concat) (partition-all cnt dss))]
-    (apply ds/concat subdss)))
-
+  #?(:clj
+     (let [cnt (max 10 (int (Math/sqrt (count dss))))        
+           subdss (pmap (partial apply ds/concat) (partition-all cnt dss))]
+       (apply ds/concat subdss))
+     :cljs (apply ds/concat dss)))
+  
 ;; grouping
 
 (defn grouped?
@@ -241,10 +254,16 @@ column-names function returns names according to columns-selector
   [ds]
   (vary-meta ds dissoc :grouped?))
 
-(let [m (meta #'unmark-group)]
-  (def ^{:doc (:doc m)
-         :arglists (:arglists m)}
-    as-regular-dataset unmark-group))
+#?(:clj
+   (let [m (meta #'unmark-group)]
+     (def ^{:doc (:doc m)
+            :arglists (:arglists m)}
+       as-regular-dataset unmark-group))
+   :cljs
+   (defn as-regular-dataset
+     "Remove grouping tag"
+     [ds]
+     (unmark-group ds)))
 
 (defn mark-as-group
   "Add grouping tag"
@@ -253,9 +272,15 @@ column-names function returns names according to columns-selector
              :grouped? true
              :print-line-policy :single))
 
+(defn add-or-update-column
+  "Add or update a column in a dataset."
+  [ds col-name data]
+  #?(:clj  (ds/add-or-update-column ds col-name data)
+     :cljs (assoc ds col-name data)))
+
 (defn process-group-data
   "Internal: The passed-in function is applied on all groups"
   ([ds f] (process-group-data ds f false))
   ([ds f parallel?]
-   (ds/add-or-update-column ds :data ((if parallel? pmap map) f (ds :data)))))
+   (add-or-update-column ds :data ((if parallel? pmap map) f (ds :data)))))
 
