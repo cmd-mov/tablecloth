@@ -1,10 +1,11 @@
 (ns tablecloth.api.columns
   (:refer-clojure :exclude [group-by])
   (:require [tech.v3.dataset :as ds]
-            [tech.v3.dataset.column :as col]
+            #?(:clj [tech.v3.dataset.column :as col]
+               :cljs [tech.v3.dataset.impl.column :as col-impl])
             [tech.v3.datatype :as dtype]
             [tablecloth.utils.strings :as strings]
-            [tablecloth.api.utils :refer [column-names iterable-sequence? grouped? process-group-data]]
+            [tablecloth.api.utils :refer [column-names iterable-sequence? grouped? process-group-data add-or-update-column]]
             [tablecloth.api.dataset :refer [dataset empty-ds?]]))
    
 
@@ -58,11 +59,16 @@
        (process-group-data ds #(ds/rename-columns % colmap))
        (ds/rename-columns ds colmap)))))
 
+(defn- column-name
+  [col]
+  #?(:clj  (col/column-name col)
+     :cljs (:name (meta col))))
+
 (defn- cycle-column
   [column col-cnt cnt]
   (let [q (quot cnt col-cnt)
         r (rem cnt col-cnt)
-        col-name (col/column-name column)
+        col-name (column-name column)
         tmp-ds (->> (dataset {col-name column})
                     (repeat q)
                     (apply ds/concat))]
@@ -71,17 +77,29 @@
       ((ds/concat tmp-ds
                   (dataset [(dtype/sub-buffer column 0 r)])) col-name))))
 
+(defn- new-column
+  [col-name data]
+  #?(:clj  (col/new-column col-name data)
+     :cljs (-> (ds/->dataset {col-name data})
+               (get col-name))))
+
+(defn- extend-column-with-empty
+  [column n-empty]
+  #?(:clj  (col/extend-column-with-empty column n-empty)
+     :cljs (new-column (column-name column)
+                       (clojure.core/concat column (repeat n-empty nil)))))
+
 (defn- fix-column-size-column
   [column strategy cnt]
   (let [ec (dtype/ecount column)]
     (when (and (= :strict strategy)
                (not= cnt ec))
-      (throw (Exception. (str "Column size (" ec ") should be exactly the same as dataset row count (" cnt "). Consider `:cycle` or `:na` strategy."))))
+      (throw (ex-info (str "Column size (" ec ") should be exactly the same as dataset row count (" cnt "). Consider `:cycle` or `:na` strategy.") {})))
     (cond
       (> ec cnt) (dtype/sub-buffer column 0 cnt)
       (< ec cnt) (if (= strategy :cycle)
                    (cycle-column column ec cnt)
-                   (col/extend-column-with-empty column (- cnt ec)))
+                   (extend-column-with-empty column (- cnt ec)))
       :else column)))
 
 
@@ -91,7 +109,7 @@
         seq-cnt (count column)]
     (when (and (= :strict strategy)
                (not= cnt seq-cnt))
-      (throw (Exception. (str "Sequence size (" seq-cnt ") should be exactly the same as dataset row count (" cnt "). Consider `:cycle` or `:na` strategy."))))
+      (throw (ex-info (str "Sequence size (" seq-cnt ") should be exactly the same as dataset row count (" cnt "). Consider `:cycle` or `:na` strategy.") {})))
     (if (< seq-cnt cnt)
       (if (= strategy :cycle)
         (take cnt (cycle column))
@@ -101,21 +119,26 @@
 (defn- fix-column-size
   [f ds column-name column strategy]
   (if (empty-ds? ds)
-    (ds/add-or-update-column ds column-name column)
+    (add-or-update-column ds column-name column)
     (->> (ds/row-count ds)
          (f column strategy)
-         (ds/add-or-update-column ds column-name))))
+         (add-or-update-column ds column-name))))
 
 (declare add-column)
+
+(defn- is-column?
+  [c]
+  #?(:clj (col/is-column? c)
+     :cljs (instance? col-impl/Column c)))
 
 (defn- prepare-add-column-fn
   [column-name column size-strategy]
   (cond
-    (col/is-column? column) #(fix-column-size fix-column-size-column % column-name column size-strategy)
-    (dtype/reader? column) (prepare-add-column-fn column-name (col/new-column column-name column) size-strategy)
+    (is-column? column) #(fix-column-size fix-column-size-column % column-name column size-strategy)
+    (dtype/reader? column) (prepare-add-column-fn column-name (new-column column-name column) size-strategy)
     (iterable-sequence? column) #(fix-column-size fix-column-size-seq % column-name column size-strategy)
     (fn? column) #(add-column % column-name (column %) size-strategy)
-    :else #(ds/add-or-update-column % column-name (dtype/const-reader column (ds/row-count %)))))
+    :else #(add-or-update-column % column-name (dtype/const-reader column (ds/row-count %)))))
 
 (defn add-column
   "Add or update (modify) column under `column-name`.
@@ -175,13 +198,15 @@
      (do-update-columns ds lst))))
 
 (defn map-columns
-  "Map over rows using a map function. The arity should match the columns selected."
   ([ds column-name map-fn] (map-columns ds column-name nil column-name map-fn))
   ([ds column-name columns-selector map-fn] (map-columns ds column-name nil columns-selector map-fn))
   ([ds column-name new-type columns-selector map-fn]
    (if (grouped? ds)
      (process-group-data ds #(map-columns % column-name new-type columns-selector map-fn))
-     (add-column ds column-name (apply col/column-map map-fn new-type (ds/columns (select-columns ds columns-selector)))))))
+     (let [src-cols (column-names ds columns-selector)]
+       (if new-type
+         (ds/column-map ds column-name map-fn {:datatype new-type} src-cols)
+         (ds/column-map ds column-name map-fn src-cols))))))
 
 (defn reorder-columns
   "Reorder columns using column selector(s). When column names are incomplete, the missing will be attached at the end."
@@ -197,7 +222,12 @@
                                           (complement)))]
       (ds/select-columns ds (clojure.core/concat selected-cols rest-cols)))))
 
-;;
+(defn- parse-column
+  [datatype col]
+  #?(:clj  (col/parse-column datatype col)
+     :cljs (let [cname (column-name col)]
+             (-> (ds/->dataset {cname col} {:parser-fn {cname datatype}})
+                 (get cname)))))
 
 (defn- process-convert-column-type
   ([ds colname new-type]
@@ -206,17 +236,17 @@
      (cond
        (nil? new-type) (-> (ds/->dataset {colname (ds/column ds colname)})
                            (ds/column colname)
-                           (->> (ds/add-or-update-column ds colname)))
+                           (->> (add-or-update-column ds colname)))
        (= :object new-type) (ds/column-cast ds colname [:object identity])
        :else (let [col (ds colname)]
                (condp = (dtype/get-datatype col)
-                 :string (ds/add-or-update-column ds colname (col/parse-column new-type col))
-                 :text (ds/add-or-update-column ds colname (col/parse-column new-type col))
+                 :string (add-or-update-column ds colname (parse-column new-type col))
+                 :text (add-or-update-column ds colname (parse-column new-type col))
                  :object (if (string? (dtype/get-value col 0))
                            (-> (ds/column-cast ds colname :string)
                                (ds/column colname)
-                               (->> (col/parse-column new-type)
-                                    (ds/add-or-update-column ds colname)))
+                               (->> (parse-column new-type)
+                                    (add-or-update-column ds colname)))
                            (ds/column-cast ds colname new-type))
                  (ds/column-cast ds colname new-type)))))))
 
